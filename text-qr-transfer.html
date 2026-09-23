@@ -354,6 +354,8 @@
 
             <div style="margin-top:20px;">
                 <button class="btn" onclick="decodeImages()">开始解码</button>
+                <button class="btn" style="background:linear-gradient(135deg,#f093fb 0%,#f5576c 100%);margin-left:10px;" onclick="decodeMultiQR()">🔍 一图多码解码</button>
+                <span id="decoderInfo" style="margin-left:15px;color:#666;font-size:13px;vertical-align:middle;"></span>
                 <button class="btn btn-secondary" onclick="clearDecode()">清空</button>
             </div>
 
@@ -380,6 +382,15 @@
             } else {
                 document.querySelectorAll('.tab')[1].classList.add('active');
                 document.getElementById('decode-panel').classList.add('active');
+                // 显示当前使用的解码器
+                const decoderInfo = document.getElementById('decoderInfo');
+                if ('BarcodeDetector' in window) {
+                    decoderInfo.textContent = '✅ 当前使用 BarcodeDetector（浏览器原生）';
+                    decoderInfo.style.color = '#28a745';
+                } else {
+                    decoderInfo.textContent = '⚠️ 当前使用 ZXing-JS（降级模式，首次使用需加载）';
+                    decoderInfo.style.color = '#dc3545';
+                }
             }
         }
 
@@ -782,6 +793,280 @@
             document.getElementById('previewContainer').innerHTML = '';
             document.getElementById('decodeProgress').style.display = 'none';
             document.getElementById('decodeResult').innerHTML = '';
+        }
+
+        // ========== 一图多码解码功能 ==========
+        
+        // 动态加载 ZXing-JS（仅在需要时加载）
+        let zxingLoaded = false;
+        async function loadZXing() {
+            if (window.ZXing) {
+                zxingLoaded = true;
+                return window.ZXing;
+            }
+            
+            return new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = 'zxing.min.js';
+                script.onload = () => {
+                    zxingLoaded = true;
+                    resolve(window.ZXing);
+                };
+                script.onerror = () => reject(new Error('ZXing 库加载失败，请检查网络连接'));
+                document.head.appendChild(script);
+            });
+        }
+
+        // 使用 BarcodeDetector 解码（Chrome/Edge 原生支持）
+        async function decodeWithBarcodeDetector(img) {
+            if (!('BarcodeDetector' in window)) return null;
+            
+            try {
+                const detector = new BarcodeDetector({ formats: ['qr_code'] });
+                const barcodes = await detector.detect(img);
+                return barcodes.map(b => b.rawValue);
+            } catch (e) {
+                console.warn('BarcodeDetector 解码失败:', e);
+                return null;
+            }
+        }
+
+        // 使用 ZXing-JS 解码（降级方案，网格扫描）
+        async function decodeWithZXing(img) {
+            try {
+                const ZXing = await loadZXing();
+                
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                
+                const width = canvas.width;
+                const height = canvas.height;
+                const reader = new ZXing.QRCodeReader();
+                const results = [];
+                const seen = new Set();
+                
+                // 网格扫描：块大小 600px，重叠 100px（步长 500px）
+                const blockSize = 600;
+                const step = 500;
+                
+                for (let y = 0; y < height; y += step) {
+                    for (let x = 0; x < width; x += step) {
+                        const bw = Math.min(blockSize, width - x);
+                        const bh = Math.min(blockSize, height - y);
+                        
+                        const blockCanvas = document.createElement('canvas');
+                        blockCanvas.width = bw;
+                        blockCanvas.height = bh;
+                        const bctx = blockCanvas.getContext('2d');
+                        bctx.drawImage(canvas, x, y, bw, bh, 0, 0, bw, bh);
+                        
+                        const imageData = bctx.getImageData(0, 0, bw, bh);
+                        const grayBytes = new Uint8ClampedArray(bw * bh);
+                        for (let i = 0; i < imageData.data.length; i += 4) {
+                            grayBytes[i / 4] = (imageData.data[i] * 299 + imageData.data[i + 1] * 587 + imageData.data[i + 2] * 114) / 1000;
+                        }
+                        
+                        try {
+                            const source = new ZXing.RGBLuminanceSource(grayBytes, bw, bh);
+                            const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(source));
+                            const result = reader.decode(bitmap);
+                            const text = result.getText();
+                            if (!seen.has(text)) {
+                                seen.add(text);
+                                results.push(text);
+                            }
+                        } catch (e) {
+                            // 该块未识别二维码，继续
+                        }
+                    }
+                }
+                
+                return results.length > 0 ? results : null;
+            } catch (e) {
+                console.warn('ZXing 解码失败:', e);
+                return null;
+            }
+        }
+
+        // 一图多码解码主函数
+        async function decodeMultiQR() {
+            if (uploadedImages.length === 0) {
+                alert('请先上传图片');
+                return;
+            }
+
+            const progressDiv = document.getElementById('decodeProgress');
+            const progressFill = document.getElementById('progressFill');
+            const progressText = document.getElementById('progressText');
+            const resultDiv = document.getElementById('decodeResult');
+            
+            progressDiv.style.display = 'block';
+            resultDiv.innerHTML = '';
+            progressText.textContent = '正在初始化解码器...';
+
+            const allResults = []; // 存储所有解码结果
+            const hasBarcodeDetector = 'BarcodeDetector' in window;
+            
+            // 如果不支持 BarcodeDetector，预加载 ZXing
+            if (!hasBarcodeDetector) {
+                progressText.textContent = '正在加载 ZXing 解码库...';
+                try {
+                    await loadZXing();
+                } catch (e) {
+                    resultDiv.innerHTML = `<div class="error">${e.message}</div>`;
+                    return;
+                }
+            }
+
+            for (let i = 0; i < uploadedImages.length; i++) {
+                const img = uploadedImages[i];
+                progressText.textContent = `正在解码图片 ${i + 1} / ${uploadedImages.length}...`;
+                
+                let results = null;
+                
+                // 优先使用 BarcodeDetector
+                if (hasBarcodeDetector) {
+                    results = await decodeWithBarcodeDetector(img);
+                }
+                
+                // 降级到 ZXing
+                if (results === null) {
+                    results = await decodeWithZXing(img);
+                }
+                
+                if (results && results.length > 0) {
+                    allResults.push({
+                        imageIndex: i + 1,
+                        codes: results
+                    });
+                } else {
+                    console.warn(`图片 ${i + 1} 未识别二维码`);
+                }
+
+                const progress = ((i + 1) / uploadedImages.length) * 100;
+                progressFill.style.width = progress + '%';
+            }
+
+            // 统计结果
+            const totalCodes = allResults.reduce((sum, r) => sum + r.codes.length, 0);
+            
+            if (totalCodes === 0) {
+                resultDiv.innerHTML = `<div class="error">未识别到任何二维码，请确保图片清晰完整</div>`;
+                return;
+            }
+
+            // 解析分片数据
+            const chunks = [];
+            let hasCompression = false;
+            let totalChunks = 0;
+            let parseErrors = [];
+
+            for (const result of allResults) {
+                for (const code of result.codes) {
+                    try {
+                        const metadata = JSON.parse(code);
+                        if (metadata.v === 1) {
+                            chunks[metadata.i] = metadata.d;
+                            hasCompression = metadata.c === 1;
+                            totalChunks = metadata.t;
+                        }
+                    } catch (e) {
+                        // 纯文本，直接保存
+                        parseErrors.push({ image: result.imageIndex, data: code });
+                    }
+                }
+            }
+
+            // 检查是否有缺失的分片
+            const missingChunks = [];
+            for (let i = 0; i < totalChunks; i++) {
+                if (chunks[i] === undefined) {
+                    missingChunks.push(i + 1);
+                }
+            }
+
+            // 重组数据
+            let finalText = '';
+            
+            if (totalChunks > 0 && missingChunks.length === 0) {
+                // 完整分片数据
+                const fullData = chunks.join('');
+                
+                if (hasCompression) {
+                    try {
+                        finalText = LZString.decompressFromBase64(fullData);
+                        if (!finalText) {
+                            resultDiv.innerHTML = `<div class="error">解压失败！二维码数据可能被截断或损坏</div>`;
+                            return;
+                        }
+                    } catch (e) {
+                        resultDiv.innerHTML = `<div class="error">解压异常: ${e.message}</div>`;
+                        return;
+                    }
+                } else {
+                    finalText = fullData;
+                }
+            }
+
+            // 显示结果
+            progressText.textContent = '解码完成!';
+            
+            let resultHTML = `<div class="success">✅ 成功从 ${uploadedImages.length} 张图片中识别 ${totalCodes} 个二维码</div>`;
+            
+            if (finalText && finalText.trim() !== '') {
+                resultHTML += `
+                    <div class="form-group" style="margin-top:20px;">
+                        <label>重组文本（${finalText.length} 字符）：</label>
+                        <textarea id="multiOutputText" rows="10" readonly>${finalText}</textarea>
+                    </div>
+                    <button class="btn" onclick="copyMultiResult()">📋 复制文本</button>
+                    <button class="btn btn-secondary" onclick="downloadMultiResult()">💾 下载文本</button>
+                `;
+            } else if (totalChunks > 0 && missingChunks.length > 0) {
+                resultHTML += `<div class="error" style="margin-top:15px;">分片不完整，缺失: ${missingChunks.join(', ')}</div>`;
+            }
+
+            // 显示每个二维码的原始数据
+            resultHTML += `
+                <div style="margin-top:30px;">
+                    <h4>解码详情：</h4>
+                    <div style="max-height:400px;overflow-y:auto;margin-top:10px;">
+            `;
+            
+            for (const result of allResults) {
+                resultHTML += `<div style="margin:10px 0;padding:10px;background:#f8f9fa;border-radius:6px;">`;
+                resultHTML += `<strong>图片 ${result.imageIndex}（${result.codes.length} 个二维码）：</strong>`;
+                for (let i = 0; i < result.codes.length; i++) {
+                    const preview = result.codes[i].substring(0, 100);
+                    resultHTML += `<div style="margin:5px 0;padding:5px;background:white;border-radius:4px;font-family:monospace;font-size:12px;word-break:break-all;">[${i + 1}] ${preview}${result.codes[i].length > 100 ? '...' : ''}</div>`;
+                }
+                resultHTML += `</div>`;
+            }
+            
+            resultHTML += `</div></div>`;
+            
+            resultDiv.innerHTML = resultHTML;
+        }
+
+        function copyMultiResult() {
+            const outputText = document.getElementById('multiOutputText');
+            outputText.select();
+            document.execCommand('copy');
+            alert('已复制到剪贴板');
+        }
+
+        function downloadMultiResult() {
+            const text = document.getElementById('multiOutputText').value;
+            const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'decoded_multi_text.txt';
+            a.click();
+            URL.revokeObjectURL(url);
         }
     </script>
 </body>
